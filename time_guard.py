@@ -3,19 +3,51 @@ from __future__ import annotations
 import argparse
 import os
 import sqlite3
-import subprocess
 import sys
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
+import json
+import urllib.request
+import urllib.error
+import threading
+import pystray
+from PIL import Image, ImageDraw
 
-# Notifications (cross-platform-ish)
-try:
-    from plyer import notification
-except Exception:
-    notification = None  # fallback: prints only
+def get_app_dir() -> str:
+    # Windows-friendly app data folder
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        path = os.path.join(base, "TimeGuard")
+    else:
+        # Linux/macOS
+        path = os.path.join(os.path.expanduser("~"), ".timeguard")
+    os.makedirs(path, exist_ok=True)
+    return path
 
+def get_db_path() -> str:
+    return os.path.join(get_app_dir(), "assistant.db")
+
+def get_lock_path() -> str:
+    return os.path.join(get_app_dir(), "assistant_ui.lock")
+
+def get_self_launch_cmd() -> List[str]:
+    # When frozen by PyInstaller, sys.executable is the .exe
+    # When running as a .py, sys.executable is python and sys.argv[0] is the script path.
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, os.path.abspath(sys.argv[0])]
+
+def make_tray_icon() -> Image.Image:
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((8, 8, size - 8, size - 8), fill=(40, 40, 40, 255))
+    d.rectangle((30, 18, 34, 46), fill=(255, 255, 255, 255))  # simple "!"
+    d.rectangle((30, 50, 34, 54), fill=(255, 255, 255, 255))
+    return img
 
 # -------------------------
 # Data model
@@ -36,8 +68,11 @@ class Reminder:
 # -------------------------
 
 class Storage:
-    def __init__(self, db_path: str = "assistant.db") -> None:
+    def __init__(self, db_path: Optional[str] = None) -> None:
+        if db_path is None:
+            db_path = get_db_path()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        ...
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._init_schema()
@@ -350,6 +385,7 @@ def parse_when(tokens: List[str]) -> datetime:
     raise ValueError("Try: in 10m | at 14:30 | tomorrow 09:00 | 2026-01-12 18:00")
 
 
+
 def format_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
@@ -395,6 +431,59 @@ class Engine:
 
         return notifications
 
+_ui_lock = threading.Lock()
+_ui_open = False
+
+class ServiceRunner:
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        last_nag = 0.0
+        nag_every_seconds = 60.0
+
+        storage = Storage()
+        storage.enable_all_reminders()
+        storage.enable_all_routines()
+        engine = Engine(storage)
+
+        while not self._stop.is_set():
+            notes = engine.tick()
+
+            now_t = time.time()
+
+            # nag if unacked alerts exist
+            if now_t - last_nag >= nag_every_seconds:
+                unacked = storage.get_unacked_alerts()
+                if unacked:
+                    last_nag = now_t
+                    preview = "\n".join([f"[{aid}] {msg}" for (aid, _ts, _src, msg) in unacked[:3]])
+                    if len(unacked) > 3:
+                        preview += f"\n(+{len(unacked)-3} more)"
+                    send_notification("Pending alerts (ack needed)", preview, blink_seconds=12, force_foreground=True)
+
+            # new alerts
+            if notes:
+                for n in notes:
+                    storage.add_alert(n, source="reminder")
+
+                msg = "\n".join(notes[:3]) + ("" if len(notes) <= 3 else f"\n(+{len(notes)-3} more)")
+                send_notification("Personal Assistant", msg, blink_seconds=12, force_foreground=True)
+
+                # optional: auto-open UI when something triggers
+                # open_ui_window(prefill=msg)
+
+            time.sleep(2.0)
 
 # -------------------------
 # UI popup (Tkinter)
@@ -669,17 +758,37 @@ def run_ui_popup(prefill: str = "") -> None:
 # Service (background)
 # -------------------------
 
-def send_notification(title: str, message: str) -> None:
-    if notification is None:
-        print(f"[NOTIFY] {title}: {message}")
-        return
+def send_notification(
+    title: str,
+    message: str,
+    sound: str = "beep",
+    blink_seconds: int = 8,
+    screen: int = 1,
+    position: str = "top_right",
+    force_foreground: bool = True,
+) -> None:
+    url = "http://127.0.0.1:17333/notify"
+    payload = {
+        "title": title,
+        "message": message,
+        "sound": sound,
+        "blink_seconds": blink_seconds,
+        "screen": screen,
+        "position": position,
+        "force_foreground": force_foreground,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
     try:
-        notification.notify(title=title, message=message, timeout=8)
+        urllib.request.urlopen(req, timeout=1.5).close()
     except Exception:
-        print(f"[NOTIFY] {title}: {message}")
+        print(f"[NOTIFY FALLBACK] {title}: {message}")
 
 
-def is_ui_already_open(lock_path: str = "assistant_ui.lock") -> bool:
+def is_ui_already_open(lock_path: Optional[str] = None) -> bool:
+    lock_path = lock_path or get_lock_path()
     # Simple lock file approach for POC.
     # If lock exists and is "fresh", assume UI is open.
     if not os.path.exists(lock_path):
@@ -712,10 +821,10 @@ def run_service() -> None:
                 preview = "\n".join([f"[{aid}] {msg}" for (aid, _ts, _src, msg) in unacked[:3]])
                 if len(unacked) > 3:
                     preview += f"\n(+{len(unacked)-3} more)"
-                send_notification("⏰ Pending alerts (ack needed)", preview)
+                send_notification("Pending alerts (ack needed)", preview)
 
                 if not is_ui_already_open():
-                    subprocess.Popen([sys.executable, __file__, "--ui", "--prefill", preview])
+                    subprocess.Popen(get_self_launch_cmd() + ["--ui"])
 
 
         if notes:
@@ -728,7 +837,7 @@ def run_service() -> None:
             send_notification("Personal Assistant", msg)
 
             if not is_ui_already_open():
-                subprocess.Popen([sys.executable, __file__, "--ui", "--prefill", msg])
+                subprocess.Popen(get_self_launch_cmd() + ["--ui"])
 
 
         time.sleep(2.0)
@@ -736,7 +845,7 @@ def run_service() -> None:
 
 def run_ui_mode(prefill: str) -> None:
     # Update lock file periodically so service knows UI is open
-    lock_path = "assistant_ui.lock"
+    lock_path = get_lock_path()
     with open(lock_path, "w", encoding="utf-8") as f:
         f.write("open")
 
@@ -765,6 +874,24 @@ def run_ui_mode(prefill: str) -> None:
         except Exception:
             pass
 
+def run_tray() -> None:
+    runner = ServiceRunner()
+    runner.start()
+
+    def on_open(_icon, _item) -> None:
+        subprocess.Popen(get_self_launch_cmd() + ["--ui"])
+
+    def on_quit(icon, _item) -> None:
+        runner.stop()
+        icon.stop()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open UI", on_open),
+        pystray.MenuItem("Quit", on_quit),
+    )
+
+    icon = pystray.Icon("TimeGuard", make_tray_icon(), "TimeGuard", menu)
+    icon.run()
 
 # -------------------------
 # Entrypoint
@@ -775,6 +902,7 @@ def main() -> None:
     ap.add_argument("--service", action="store_true", help="Run background reminder service")
     ap.add_argument("--ui", action="store_true", help="Run UI popup window")
     ap.add_argument("--prefill", type=str, default="", help="Prefill message for UI")
+    ap.add_argument("--tray", action="store_true", help="Run tray daemon")
     args = ap.parse_args()
 
     if args.service:
@@ -785,8 +913,12 @@ def main() -> None:
         run_ui_mode(args.prefill)
         return
 
+    if args.tray:
+        run_tray()
+        return
+
     # Default: open UI
-    run_ui_mode(args.prefill)
+    run_tray()
 
 
 if __name__ == "__main__":

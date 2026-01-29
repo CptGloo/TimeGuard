@@ -1,0 +1,61 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.coverage
+htmlcov/
+dist-info/
+
+# ---- Virtual envs ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Editors / IDEs ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- OS files ----
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ---- Logs ----
+*.log
+
+# ---- Local app data / runtime ----
+assistant.db
+assistant.db-shm
+assistant.db-wal
+*.db
+*.db-shm
+*.db-wal
+assistant_ui.lock
+*.lock
+
+# ---- PyInstaller ----
+build/
+dist/
+*.spec
+
+# ---- Packaging / installers (optional) ----
+*.msi
+*.exe
+*.zip
+*.tar.gz
+
+# ---- Pillow / tray icon artifacts (if you export images) ----
+*.png
+*.ico
