@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
-import sys
 import subprocess
+import sys
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
-import json
-import urllib.request
-import urllib.error
-import threading
+
 import pystray
 from PIL import Image, ImageDraw
+
 
 def get_app_dir() -> str:
     # Windows-friendly app data folder
@@ -22,321 +23,33 @@ def get_app_dir() -> str:
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
         path = os.path.join(base, "TimeGuard")
     else:
-        # Linux/macOS
         path = os.path.join(os.path.expanduser("~"), ".timeguard")
     os.makedirs(path, exist_ok=True)
     return path
 
+
 def get_db_path() -> str:
     return os.path.join(get_app_dir(), "assistant.db")
+
 
 def get_lock_path() -> str:
     return os.path.join(get_app_dir(), "assistant_ui.lock")
 
+
 def get_self_launch_cmd() -> List[str]:
-    # When frozen by PyInstaller, sys.executable is the .exe
-    # When running as a .py, sys.executable is python and sys.argv[0] is the script path.
     if getattr(sys, "frozen", False):
         return [sys.executable]
     return [sys.executable, os.path.abspath(sys.argv[0])]
+
 
 def make_tray_icon() -> Image.Image:
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.ellipse((8, 8, size - 8, size - 8), fill=(40, 40, 40, 255))
-    d.rectangle((30, 18, 34, 46), fill=(255, 255, 255, 255))  # simple "!"
+    d.rectangle((30, 18, 34, 46), fill=(255, 255, 255, 255))
     d.rectangle((30, 50, 34, 54), fill=(255, 255, 255, 255))
     return img
-
-# -------------------------
-# Data model
-# -------------------------
-
-@dataclass(frozen=True)
-class Reminder:
-    id: int
-    title: str
-    note: str
-    due_at: datetime
-    repeat_minutes: Optional[int]
-    enabled: bool
-
-
-# -------------------------
-# Storage (SQLite)
-# -------------------------
-
-class Storage:
-    def __init__(self, db_path: Optional[str] = None) -> None:
-        if db_path is None:
-            db_path = get_db_path()
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        ...
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA foreign_keys=ON;")
-        self._init_schema()
-
-    def _init_schema(self) -> None:
-        self._conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS activity_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                text TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                note TEXT NOT NULL DEFAULT '',
-                due_at TEXT NOT NULL,
-                repeat_minutes INTEGER,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                last_fired_at TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_reminders_due
-            ON reminders(enabled, due_at);
-
-            CREATE TABLE IF NOT EXISTS routines (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                note TEXT NOT NULL DEFAULT '',
-                time_hhmm TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS active_alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,     -- ISO datetime
-                message TEXT NOT NULL,
-                source TEXT NOT NULL,         -- reminder|routine
-                acknowledged INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_active_alerts_ack
-            ON active_alerts(acknowledged, created_at);
-            """
-        )
-        self._conn.commit()
-
-    def add_alert(self, message: str, source: str) -> int:
-        now = datetime.now().isoformat(timespec="seconds")
-        cur = self._conn.execute(
-            "INSERT INTO active_alerts(created_at, message, source, acknowledged) VALUES (?, ?, ?, 0)",
-            (now, message, source),
-        )
-        self._conn.commit()
-        return int(cur.lastrowid)
-
-    def get_unacked_alerts(self) -> List[Tuple[int, str, str, str]]:
-        cur = self._conn.execute(
-            "SELECT id, created_at, source, message FROM active_alerts WHERE acknowledged=0 ORDER BY id ASC"
-        )
-        return list(cur.fetchall())
-
-    def ack_alert(self, alert_id: int) -> None:
-        self._conn.execute("UPDATE active_alerts SET acknowledged=1 WHERE id=?", (alert_id,))
-        self._conn.commit()
-
-    def ack_all_alerts(self) -> None:
-        self._conn.execute("UPDATE active_alerts SET acknowledged=1 WHERE acknowledged=0")
-        self._conn.commit()
-
-
-    def add_activity(self, kind: str, text: str, ts: Optional[datetime] = None) -> None:
-        ts = ts or datetime.now()
-        self._conn.execute(
-            "INSERT INTO activity_log(ts, kind, text) VALUES (?, ?, ?)",
-            (ts.isoformat(timespec="seconds"), kind, text),
-        )
-        self._conn.commit()
-
-    def get_recent_activity(self, limit: int = 20) -> List[Tuple[str, str, str]]:
-        cur = self._conn.execute(
-            "SELECT ts, kind, text FROM activity_log ORDER BY id DESC LIMIT ?",
-            (limit,),
-        )
-        return list(cur.fetchall())
-
-    def enable_all_reminders(self) -> None:
-        self._conn.execute("UPDATE reminders SET enabled=1")
-        self._conn.commit()
-
-    def enable_all_routines(self) -> None:
-        self._conn.execute("UPDATE routines SET enabled=1")
-        self._conn.commit()
-
-
-    def add_reminder(
-        self,
-        title: str,
-        due_at: datetime,
-        note: str = "",
-        repeat_minutes: Optional[int] = None,
-    ) -> int:
-        cur = self._conn.execute(
-            """
-            INSERT INTO reminders(title, note, due_at, repeat_minutes, enabled)
-            VALUES (?, ?, ?, ?, 1)
-            """,
-            (title, note, due_at.isoformat(timespec="seconds"), repeat_minutes),
-        )
-        self._conn.commit()
-        return int(cur.lastrowid)
-
-    def set_reminder_enabled(self, reminder_id: int, enabled: bool) -> None:
-        self._conn.execute(
-            "UPDATE reminders SET enabled=? WHERE id=?",
-            (1 if enabled else 0, reminder_id),
-        )
-        self._conn.commit()
-
-    def list_reminders(self) -> List[Reminder]:
-        cur = self._conn.execute(
-            "SELECT id, title, note, due_at, repeat_minutes, enabled FROM reminders ORDER BY due_at ASC"
-        )
-        rows = cur.fetchall()
-        out: List[Reminder] = []
-        for rid, title, note, due_at, repeat, enabled in rows:
-            out.append(
-                Reminder(
-                    id=rid,
-                    title=title,
-                    note=note or "",
-                    due_at=datetime.fromisoformat(due_at),
-                    repeat_minutes=repeat,
-                    enabled=bool(enabled),
-                )
-            )
-        return out
-
-    def get_due_reminders(self, now: datetime) -> List[Reminder]:
-        cur = self._conn.execute(
-            """
-            SELECT id, title, note, due_at, repeat_minutes, enabled
-            FROM reminders
-            WHERE enabled=1 AND due_at <= ?
-            ORDER BY due_at ASC
-            """,
-            (now.isoformat(timespec="seconds"),),
-        )
-        rows = cur.fetchall()
-        out: List[Reminder] = []
-        for rid, title, note, due_at, repeat, enabled in rows:
-            out.append(
-                Reminder(
-                    id=rid,
-                    title=title,
-                    note=note or "",
-                    due_at=datetime.fromisoformat(due_at),
-                    repeat_minutes=repeat,
-                    enabled=bool(enabled),
-                )
-            )
-        return out
-
-    def snooze_reminder(self, reminder_id: int, minutes: int) -> None:
-        new_due = datetime.now() + timedelta(minutes=minutes)
-        self._conn.execute(
-            "UPDATE reminders SET due_at=? WHERE id=?",
-            (new_due.isoformat(timespec="seconds"), reminder_id),
-        )
-        self._conn.commit()
-
-    def fire_reminder(self, reminder: Reminder, fired_at: datetime) -> None:
-        if reminder.repeat_minutes is None:
-            self._conn.execute(
-                "UPDATE reminders SET enabled=0, last_fired_at=? WHERE id=?",
-                (fired_at.isoformat(timespec="seconds"), reminder.id),
-            )
-        else:
-            next_due = max(reminder.due_at, fired_at) + timedelta(minutes=reminder.repeat_minutes)
-            self._conn.execute(
-                "UPDATE reminders SET due_at=?, last_fired_at=? WHERE id=?",
-                (
-                    next_due.isoformat(timespec="seconds"),
-                    fired_at.isoformat(timespec="seconds"),
-                    reminder.id,
-                ),
-            )
-        self._conn.commit()
-
-    def add_routine(self, title: str, time_hhmm: str, note: str = "") -> int:
-        cur = self._conn.execute(
-            """
-            INSERT INTO routines(title, note, time_hhmm, enabled)
-            VALUES (?, ?, ?, 1)
-            """,
-            (title, note, time_hhmm),
-        )
-        self._conn.commit()
-        return int(cur.lastrowid)
-
-    def list_routines(self) -> List[Tuple[int, str, str, str, bool]]:
-        cur = self._conn.execute(
-            "SELECT id, title, note, time_hhmm, enabled FROM routines ORDER BY time_hhmm ASC"
-        )
-        rows = cur.fetchall()
-        return [(rid, t, n or "", hhmm, bool(en)) for (rid, t, n, hhmm, en) in rows]
-
-    # ---- reminders: delete / edit ----
-
-    def delete_reminder(self, reminder_id: int) -> None:
-        self._conn.execute("DELETE FROM reminders WHERE id=?", (reminder_id,))
-        self._conn.commit()
-
-    def update_reminder_title(self, reminder_id: int, title: str) -> None:
-        self._conn.execute("UPDATE reminders SET title=? WHERE id=?", (title, reminder_id))
-        self._conn.commit()
-
-    def update_reminder_note(self, reminder_id: int, note: str) -> None:
-        self._conn.execute("UPDATE reminders SET note=? WHERE id=?", (note, reminder_id))
-        self._conn.commit()
-
-    def update_reminder_due_at(self, reminder_id: int, due_at: datetime) -> None:
-        self._conn.execute(
-            "UPDATE reminders SET due_at=? WHERE id=?",
-            (due_at.isoformat(timespec="seconds"), reminder_id),
-        )
-        self._conn.commit()
-
-    def update_reminder_repeat_minutes(self, reminder_id: int, repeat_minutes: Optional[int]) -> None:
-        self._conn.execute(
-            "UPDATE reminders SET repeat_minutes=? WHERE id=?",
-            (repeat_minutes, reminder_id),
-        )
-        self._conn.commit()
-
-
-    # ---- routines: enable/disable / delete / edit ----
-
-    def set_routine_enabled(self, routine_id: int, enabled: bool) -> None:
-        self._conn.execute(
-            "UPDATE routines SET enabled=? WHERE id=?",
-            (1 if enabled else 0, routine_id),
-        )
-        self._conn.commit()
-
-    def delete_routine(self, routine_id: int) -> None:
-        self._conn.execute("DELETE FROM routines WHERE id=?", (routine_id,))
-        self._conn.commit()
-
-    def update_routine_title(self, routine_id: int, title: str) -> None:
-        self._conn.execute("UPDATE routines SET title=? WHERE id=?", (title, routine_id))
-        self._conn.commit()
-
-    def update_routine_note(self, routine_id: int, note: str) -> None:
-        self._conn.execute("UPDATE routines SET note=? WHERE id=?", (note, routine_id))
-        self._conn.commit()
-
-    def update_routine_time(self, routine_id: int, time_hhmm: str) -> None:
-        _ = parse_hhmm(time_hhmm)  # validate
-        self._conn.execute("UPDATE routines SET time_hhmm=? WHERE id=?", (time_hhmm, routine_id))
-        self._conn.commit()
-
 
 
 # -------------------------
@@ -354,40 +67,410 @@ def parse_hhmm(hhmm: str) -> Tuple[int, int]:
     return h, m
 
 
-def parse_when(tokens: List[str]) -> datetime:
-    now = datetime.now()
-
-    if len(tokens) >= 2 and tokens[0] == "in":
-        amt = tokens[1].lower().strip()
-        if amt.endswith("m"):
-            mins = int(amt[:-1])
-            return now + timedelta(minutes=mins)
-        if amt.endswith("h"):
-            hrs = int(amt[:-1])
-            return now + timedelta(hours=hrs)
-        raise ValueError("Use in 10m or in 2h")
-
-    if len(tokens) >= 2 and tokens[0] in ("at", "today", "tomorrow"):
-        hhmm = tokens[1]
-        h, m = parse_hhmm(hhmm)
-        base = now.date()
-        if tokens[0] == "tomorrow":
-            base = (now + timedelta(days=1)).date()
-        return datetime.combine(base, datetime.min.time()).replace(hour=h, minute=m, second=0)
-
-    if len(tokens) >= 2 and "-" in tokens[0]:
-        date_str = tokens[0]
-        hhmm = tokens[1]
-        y, mo, d = [int(x) for x in date_str.split("-")]
-        h, m = parse_hhmm(hhmm)
-        return datetime(y, mo, d, h, m, 0)
-
-    raise ValueError("Try: in 10m | at 14:30 | tomorrow 09:00 | 2026-01-12 18:00")
-
+def next_occurrence_at(hhmm: str, now: Optional[datetime] = None) -> datetime:
+    now = now or datetime.now()
+    h, m = parse_hhmm(hhmm)
+    candidate = datetime.combine(now.date(), datetime.min.time()).replace(hour=h, minute=m, second=0)
+    if candidate <= now:
+        candidate = candidate + timedelta(days=1)
+    return candidate
 
 
 def format_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
+
+
+# -------------------------
+# Data model
+# -------------------------
+
+@dataclass(frozen=True)
+class Cycle:
+    name: str
+    start_time_hhmm: str
+    enabled: bool
+    auto_enable: bool
+    auto_trigger: bool
+    next_due: datetime
+    current_index: int
+    waiting_ack: bool
+
+
+@dataclass(frozen=True)
+class CycleTask:
+    index: int
+    minutes_after_ack: int
+    message: str
+
+
+# -------------------------
+# Storage (SQLite)
+# -------------------------
+
+class Storage:
+    def __init__(self, db_path: Optional[str] = None) -> None:
+        self._db_path = db_path or get_db_path()
+        self._reset_if_legacy_schema()
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA foreign_keys=ON;")
+        self._init_schema()
+        self._reset_if_schema_mismatch()
+
+    def _reset_if_legacy_schema(self) -> None:
+        # Start fresh: if we detect any legacy tables, back up the DB and recreate.
+        if not os.path.exists(self._db_path):
+            return
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                tables = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                legacy_markers = {"reminders", "routines", "activity_log"}
+                if tables.intersection(legacy_markers):
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup = self._db_path + f".legacy_{ts}.bak"
+                    conn.close()
+                    conn = None
+                    os.replace(self._db_path, backup)
+            finally:
+                if conn is not None:
+                    conn.close()
+        except Exception:
+            return
+
+    def _init_schema(self) -> None:
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS cycles (
+                name TEXT PRIMARY KEY,
+                start_time_hhmm TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                auto_enable INTEGER NOT NULL DEFAULT 0,
+                auto_trigger INTEGER NOT NULL DEFAULT 0,
+                next_due TEXT NOT NULL,
+                current_index INTEGER NOT NULL DEFAULT 0,
+                waiting_ack INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS cycle_tasks (
+                cycle_name TEXT NOT NULL,
+                task_index INTEGER NOT NULL,
+                minutes_after_ack INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                PRIMARY KEY (cycle_name, task_index),
+                FOREIGN KEY (cycle_name) REFERENCES cycles(name) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS active_alerts (
+                alert_key TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                name TEXT NOT NULL,           -- cycle name
+                message TEXT NOT NULL,
+                source TEXT NOT NULL,         -- cycle
+                acknowledged INTEGER NOT NULL DEFAULT 0,
+                meta_json TEXT NOT NULL       -- {"task_index":int}
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_active_alerts_ack
+            ON active_alerts(acknowledged, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_active_alerts_name
+            ON active_alerts(acknowledged, name, created_at);
+            """
+        )
+        self._conn.commit()
+
+    def _reset_if_schema_mismatch(self) -> None:
+        """Start fresh if the DB exists but doesn't match our expected schema."""
+        try:
+            cols = [
+                r[1]
+                for r in self._conn.execute("PRAGMA table_info(cycles)").fetchall()
+            ]
+            required = {
+                "name",
+                "start_time_hhmm",
+                "enabled",
+                "auto_enable",
+                "auto_trigger",
+                "next_due",
+                "current_index",
+                "waiting_ack",
+            }
+            if cols and not required.issubset(set(cols)):
+                # Close current connection, back up DB, recreate from scratch.
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup = self._db_path + f".schema_{ts}.bak"
+                try:
+                    os.replace(self._db_path, backup)
+                except Exception:
+                    # If we can't back it up, still try to remove it.
+                    try:
+                        os.remove(self._db_path)
+                    except Exception:
+                        return
+
+                self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+                self._conn.execute("PRAGMA journal_mode=WAL;")
+                self._conn.execute("PRAGMA foreign_keys=ON;")
+                self._init_schema()
+        except Exception:
+            # If anything looks off, do nothing here. (We already start fresh on legacy markers.)
+            return
+
+    # ---- cycles ----
+
+    def create_cycle(
+        self,
+        name: str,
+        start_time_hhmm: str,
+        first_minutes: int,
+        first_message: str,
+        auto_enable: bool = False,
+        auto_trigger: bool = False,
+    ) -> None:
+        start_dt = next_occurrence_at(start_time_hhmm)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO cycles(
+                name, start_time_hhmm, enabled, auto_enable, auto_trigger, next_due, current_index, waiting_ack
+            )
+            VALUES (?, ?, 1, ?, ?, ?, 0, 0)
+            """,
+            (
+                name,
+                start_time_hhmm,
+                1 if auto_enable else 0,
+                1 if auto_trigger else 0,
+                start_dt.isoformat(timespec="seconds"),
+            ),
+        )
+        self._conn.execute("DELETE FROM cycle_tasks WHERE cycle_name=?", (name,))
+        self._conn.execute(
+            """
+            INSERT INTO cycle_tasks(cycle_name, task_index, minutes_after_ack, message)
+            VALUES (?, 0, ?, ?)
+            """,
+            (name, int(first_minutes), first_message),
+        )
+        self._conn.commit()
+
+    def add_task(self, cycle_name: str, minutes_after_ack: int, message: str) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(task_index), -1) FROM cycle_tasks WHERE cycle_name=?",
+            (cycle_name,),
+        ).fetchone()
+        next_index = int(row[0]) + 1
+        self._conn.execute(
+            """
+            INSERT INTO cycle_tasks(cycle_name, task_index, minutes_after_ack, message)
+            VALUES (?, ?, ?, ?)
+            """,
+            (cycle_name, next_index, int(minutes_after_ack), message),
+        )
+        self._conn.commit()
+        return next_index
+
+    def delete_cycle(self, name: str) -> None:
+        self._conn.execute("DELETE FROM cycles WHERE name=?", (name,))
+        self._conn.commit()
+
+    def set_cycle_enabled(self, name: str, enabled: bool) -> None:
+        self._conn.execute("UPDATE cycles SET enabled=? WHERE name=?", (1 if enabled else 0, name))
+        self._conn.commit()
+
+    def trigger_cycle(self, name: str) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        self._conn.execute(
+            "UPDATE cycles SET next_due=?, waiting_ack=0 WHERE name=?",
+            (now, name),
+        )
+        self._conn.commit()
+
+    def list_cycles(self) -> List[Cycle]:
+        cur = self._conn.execute(
+            """
+            SELECT name, start_time_hhmm, enabled, auto_enable, auto_trigger,
+                   next_due, current_index, waiting_ack
+            FROM cycles
+            ORDER BY name ASC
+            """
+        )
+        out: List[Cycle] = []
+        for name, hhmm, enabled, auto_enable, auto_trigger, next_due, idx, waiting_ack in cur.fetchall():
+            out.append(
+                Cycle(
+                    name=name,
+                    start_time_hhmm=hhmm,
+                    enabled=bool(enabled),
+                    auto_enable=bool(auto_enable),
+                    auto_trigger=bool(auto_trigger),
+                    next_due=datetime.fromisoformat(next_due),
+                    current_index=int(idx),
+                    waiting_ack=bool(waiting_ack),
+                )
+            )
+        return out
+
+    def get_cycle(self, name: str) -> Cycle:
+        row = self._conn.execute(
+            """
+            SELECT name, start_time_hhmm, enabled, auto_enable, auto_trigger,
+                   next_due, current_index, waiting_ack
+            FROM cycles
+            WHERE name=?
+            """,
+            (name,),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Unknown cycle '{name}'")
+        return Cycle(
+            name=row[0],
+            start_time_hhmm=row[1],
+            enabled=bool(row[2]),
+            auto_enable=bool(row[3]),
+            auto_trigger=bool(row[4]),
+            next_due=datetime.fromisoformat(row[5]),
+            current_index=int(row[6]),
+            waiting_ack=bool(row[7]),
+        )
+
+    def set_cycle_auto_enable(self, name: str, value: bool) -> None:
+        self._conn.execute(
+            "UPDATE cycles SET auto_enable=? WHERE name=?",
+            (1 if value else 0, name),
+        )
+        self._conn.commit()
+
+    def set_cycle_auto_trigger(self, name: str, value: bool) -> None:
+        self._conn.execute(
+            "UPDATE cycles SET auto_trigger=? WHERE name=?",
+            (1 if value else 0, name),
+        )
+        self._conn.commit()
+
+    def apply_autostart(self) -> None:
+        """Apply per-cycle auto_* behavior once at app start."""
+        now_iso = datetime.now().isoformat(timespec="seconds")
+
+        # auto_enable: just ensure enabled.
+        self._conn.execute("UPDATE cycles SET enabled=1 WHERE auto_enable=1")
+
+        # auto_trigger: enable AND set next_due to now to fire on next tick.
+        self._conn.execute(
+            """
+            UPDATE cycles
+            SET enabled=1, next_due=?, waiting_ack=0
+            WHERE auto_trigger=1
+            """,
+            (now_iso,),
+        )
+        self._conn.commit()
+
+    def list_tasks(self, cycle_name: str) -> List[CycleTask]:
+        cur = self._conn.execute(
+            """
+            SELECT task_index, minutes_after_ack, message
+            FROM cycle_tasks
+            WHERE cycle_name=?
+            ORDER BY task_index ASC
+            """,
+            (cycle_name,),
+        )
+        return [CycleTask(index=int(i), minutes_after_ack=int(m), message=msg) for (i, m, msg) in cur.fetchall()]
+
+    def reset_cycle(self, name: str, immediate: bool = False) -> None:
+        c = self.get_cycle(name)
+
+        if immediate:
+            next_due = datetime.now()
+        else:
+            next_due = next_occurrence_at(c.start_time_hhmm)
+
+        self._conn.execute(
+            """
+            UPDATE cycles
+            SET current_index=0,
+                waiting_ack=1,
+                next_due=?
+            WHERE name=?
+            """,
+            (next_due.isoformat(timespec="seconds"), name),
+        )
+        self._conn.commit()
+
+    # ---- alerts ----
+
+    def add_alert(self, name: str, message: str, source: str, meta: dict) -> str:
+        alert_key = uuid.uuid4().hex
+        now = datetime.now().isoformat(timespec="seconds")
+        self._conn.execute(
+            """
+            INSERT INTO active_alerts(alert_key, created_at, name, message, source, acknowledged, meta_json)
+            VALUES (?, ?, ?, ?, ?, 0, ?)
+            """,
+            (alert_key, now, name, message, source, json.dumps(meta, separators=(",", ":"))),
+        )
+        self._conn.commit()
+        return alert_key
+
+    def get_unacked_alerts(self) -> List[Tuple[str, str, str, str]]:
+        cur = self._conn.execute(
+            "SELECT name, created_at, source, message FROM active_alerts WHERE acknowledged=0 ORDER BY created_at ASC"
+        )
+        return list(cur.fetchall())
+
+    def ack_all_alerts(self) -> int:
+        cur = self._conn.execute("UPDATE active_alerts SET acknowledged=1 WHERE acknowledged=0")
+        self._conn.commit()
+        return int(cur.rowcount)
+
+    def ack_alerts_by_name(self, name: str) -> int:
+        cur = self._conn.execute(
+            "UPDATE active_alerts SET acknowledged=1 WHERE acknowledged=0 AND name=?",
+            (name,),
+        )
+        self._conn.commit()
+        return int(cur.rowcount)
+
+    def advance_cycle_on_ack(self, name: str, ack_time: Optional[datetime] = None) -> None:
+        ack_time = ack_time or datetime.now()
+        c = self.get_cycle(name)
+        if not c.waiting_ack:
+            return
+
+        tasks = self.list_tasks(name)
+        if not tasks:
+            return
+
+        current_task = next((t for t in tasks if t.index == c.current_index), tasks[0])
+        next_index = (c.current_index + 1) % len(tasks)
+        next_due = ack_time + timedelta(minutes=current_task.minutes_after_ack)
+
+        self._conn.execute(
+            """
+            UPDATE cycles
+            SET current_index=?, next_due=?, waiting_ack=0
+            WHERE name=?
+            """,
+            (next_index, next_due.isoformat(timespec="seconds"), name),
+        )
+        self._conn.commit()
+
+    def mark_cycle_waiting_ack(self, name: str) -> None:
+        self._conn.execute("UPDATE cycles SET waiting_ack=1 WHERE name=?", (name,))
+        self._conn.commit()
+
 
 
 # -------------------------
@@ -397,365 +480,32 @@ def format_dt(dt: datetime) -> str:
 class Engine:
     def __init__(self, storage: Storage) -> None:
         self._storage = storage
-        self._last_routine_check_date: Optional[str] = None
-        self._fired_routines_today: set[Tuple[str, str]] = set()
 
-    def tick(self) -> List[str]:
+    def tick(self) -> List[Tuple[str, str, str, dict]]:
         now = datetime.now()
-        notifications: List[str] = []
+        out: List[Tuple[str, str, str, dict]] = []
 
-        today_iso = now.date().isoformat()
-        if self._last_routine_check_date != today_iso:
-            self._last_routine_check_date = today_iso
-            self._fired_routines_today = set()
-
-        for r in self._storage.get_due_reminders(now):
-            line = f"REMINDER: {r.title} (due {format_dt(r.due_at)})"
-            if r.note:
-                line += f" — {r.note}"
-            notifications.append(line)
-            self._storage.fire_reminder(r, now)
-
-        for rid, title, note, time_hhmm, enabled in self._storage.list_routines():
-            if not enabled:
+        for c in self._storage.list_cycles():
+            if not c.enabled:
                 continue
-            h, m = parse_hhmm(time_hhmm)
-            routine_dt = datetime.combine(now.date(), datetime.min.time()).replace(hour=h, minute=m, second=0)
-            key = (today_iso, time_hhmm)
-            if routine_dt <= now and key not in self._fired_routines_today:
-                line = f"ROUTINE: {title} ({time_hhmm})"
-                if note:
-                    line += f" — {note}"
-                notifications.append(line)
-                self._fired_routines_today.add(key)
+            if c.waiting_ack:
+                continue
+            if c.next_due > now:
+                continue
 
-        return notifications
+            tasks = self._storage.list_tasks(c.name)
+            if not tasks:
+                continue
 
-_ui_lock = threading.Lock()
-_ui_open = False
+            task = next((t for t in tasks if t.index == c.current_index), tasks[0])
+            out.append((c.name, "cycle", task.message, {"task_index": task.index}))
+            self._storage.mark_cycle_waiting_ack(c.name)
 
-class ServiceRunner:
-    def __init__(self) -> None:
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def _run(self) -> None:
-        last_nag = 0.0
-        nag_every_seconds = 60.0
-
-        storage = Storage()
-        storage.enable_all_reminders()
-        storage.enable_all_routines()
-        engine = Engine(storage)
-
-        while not self._stop.is_set():
-            notes = engine.tick()
-
-            now_t = time.time()
-
-            # nag if unacked alerts exist
-            if now_t - last_nag >= nag_every_seconds:
-                unacked = storage.get_unacked_alerts()
-                if unacked:
-                    last_nag = now_t
-                    preview = "\n".join([f"[{aid}] {msg}" for (aid, _ts, _src, msg) in unacked[:3]])
-                    if len(unacked) > 3:
-                        preview += f"\n(+{len(unacked)-3} more)"
-                    send_notification("Pending alerts (ack needed)", preview, blink_seconds=12, force_foreground=True)
-
-            # new alerts
-            if notes:
-                for n in notes:
-                    storage.add_alert(n, source="reminder")
-
-                msg = "\n".join(notes[:3]) + ("" if len(notes) <= 3 else f"\n(+{len(notes)-3} more)")
-                send_notification("Personal Assistant", msg, blink_seconds=12, force_foreground=True)
-
-                # optional: auto-open UI when something triggers
-                # open_ui_window(prefill=msg)
-
-            time.sleep(2.0)
-
-# -------------------------
-# UI popup (Tkinter)
-# -------------------------
-
-HELP_TEXT = """
-Commands:
-  status <text>                 Log what you're doing right now
-  did <text>                    Log something you did
-  note <text>                   Log a note
-
-  remind <when> <title>         Create a one-time reminder
-  remind_repeat <when> <mins> <title>  Create repeating reminder every <mins> minutes
-
-  routine <HH:MM> <title>       Add a daily routine reminder at time
-  list                          List reminders + routines
-  recent [n]                    Show recent activity
-  snooze <id> <mins>            Snooze a reminder by minutes
-  disable <id>                  Disable a reminder
-  enable <id>                   Enable a reminder
-
-  Edit / delete:
-  rem_del <id>
-  rem_title <id> <new title...>
-  rem_note <id> <new note...>
-  rem_due <id> <when>             (ex: rem_due 3 tomorrow 09:00)
-  rem_repeat <id> <mins|off>      (ex: rem_repeat 3 30 | rem_repeat 3 off)
-
-  rt_del <id>
-  rt_enable <id>
-  rt_disable <id>
-  rt_title <id> <new title...>
-  rt_note <id> <new note...>
-  rt_time <id> <HH:MM>
-
-  ack <id>
-  ack_all
-  
-  help
-  quit
-
-Time formats:
-  in 10m     | in 2h
-  at 14:30   | today 18:00 | tomorrow 09:00
-  2026-01-12 18:00
-
-Examples:
-  status working on Godot aim trainer
-  did 30 min aim practice
-  remind in 25m stand up
-  remind_repeat at 09:00 60 drink water
-  routine 22:30 prep for tomorrow
-""".strip()
-
-
-
-def run_ui_popup(prefill: str = "") -> None:
-    import tkinter as tk
-    from tkinter import scrolledtext
-
-    storage = Storage()
-    root = tk.Tk()
-    root.title("Personal Assistant")
-    root.geometry("700x500")
-    #root.attributes("-topmost", True)
-    root.bell()
-
-    output = scrolledtext.ScrolledText(root, wrap=tk.WORD)
-    output.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-
-    entry = tk.Entry(root)
-    entry.pack(fill=tk.X, padx=8, pady=(0, 8))
-
-    def write(line: str) -> None:
-        output.insert(tk.END, line + "\n")
-        output.see(tk.END)
-
-    def refresh_recent() -> None:
-        write("— Recent activity —")
-        rows = storage.get_recent_activity(15)
-        for ts, kind, text in reversed(rows):
-            write(f"{ts} [{kind}] {text}")
-        write("")
-
-    def print_list() -> None:
-        write("— Reminders —")
-        for r in storage.list_reminders():
-            rep = f" every {r.repeat_minutes}m" if r.repeat_minutes is not None else ""
-            on = "ON" if r.enabled else "OFF"
-            write(f"[{r.id}] {on} {format_dt(r.due_at)}{rep} — {r.title}" + (f" ({r.note})" if r.note else ""))
-        write("")
-        write("— Routines (daily) —")
-        for rid, title, note, hhmm, enabled in storage.list_routines():
-            on = "ON" if enabled else "OFF"
-            write(f"[{rid}] {on} {hhmm} — {title}" + (f" ({note})" if note else ""))
-        write("")
-
-    def handle_command(cmd: str) -> None:
-        parts = cmd.strip().split()
-        if not parts:
-            return
-        op = parts[0].lower()
-        rest = parts[1:]
-
-        try:
-            if op == "help":
-                for line in HELP_TEXT.splitlines():
-                    write(line)
-
-            elif op == "quit" or op == "exit":
-                root.destroy()
-            elif op in ("status", "did", "note"):
-                text = " ".join(rest).strip()
-                storage.add_activity(op, text)
-                write("Logged.")
-            elif op == "recent":
-                refresh_recent()
-            elif op == "list":
-                print_list()
-            elif op == "remind":
-                due = parse_when(rest[:2])
-                title = " ".join(rest[2:])
-                rid = storage.add_reminder(title=title, due_at=due)
-                write(f"Created reminder [{rid}] for {format_dt(due)}.")
-            elif op == "remind_repeat":
-                due = parse_when(rest[:2])
-                mins = int(rest[2])
-                title = " ".join(rest[3:])
-                rid = storage.add_reminder(title=title, due_at=due, repeat_minutes=mins)
-                write(f"Created repeating reminder [{rid}] starting {format_dt(due)} every {mins}m.")
-            elif op == "routine":
-                hhmm = rest[0]
-                _ = parse_hhmm(hhmm)
-                title = " ".join(rest[1:])
-                rid = storage.add_routine(title=title, time_hhmm=hhmm)
-                write(f"Created routine [{rid}] at {hhmm} daily.")
-            elif op == "snooze":
-                rid = int(rest[0])
-                mins = int(rest[1])
-                storage.snooze_reminder(rid, mins)
-                write("Snoozed.")
-            elif op == "disable":
-                rid = int(rest[0])
-                storage.set_reminder_enabled(rid, False)
-                write("Disabled.")
-            elif op == "enable":
-                rid = int(rest[0])
-                storage.set_reminder_enabled(rid, True)
-                write("Enabled.")
-            elif op == "alerts":
-                rows = storage.get_unacked_alerts()
-                if not rows:
-                    write("No pending alerts 🎉")
-                else:
-                    write("— Pending alerts —")
-                    for aid, ts, src, msg in rows:
-                        write(f"[{aid}] {ts} ({src}) {msg}")
-                    write("Use: ack <id>  |  ack_all")
-            elif op == "ack":
-                aid = int(rest[0])
-                storage.ack_alert(aid)
-                write("Acknowledged.")
-
-            elif op == "ack_all":
-                storage.ack_all_alerts()
-                write("All acknowledged.")
-
-            # -------- reminders: delete / edit --------
-
-            elif op == "rem_del":
-                rid = int(rest[0])
-                storage.delete_reminder(rid)
-                write("Reminder supprimé.")
-
-            elif op == "rem_title":
-                rid = int(rest[0])
-                title = " ".join(rest[1:]).strip()
-                storage.update_reminder_title(rid, title)
-                write("Titre modifié.")
-
-            elif op == "rem_note":
-                rid = int(rest[0])
-                note = " ".join(rest[1:]).strip()
-                storage.update_reminder_note(rid, note)
-                write("Note modifiée.")
-
-            elif op == "rem_due":
-                # rem_due <id> <when...>
-                rid = int(rest[0])
-                due = parse_when(rest[1:3])  # mêmes formats que remind
-                storage.update_reminder_due_at(rid, due)
-                write(f"Date modifiée: {format_dt(due)}")
-
-            elif op == "rem_repeat":
-                # rem_repeat <id> off  | rem_repeat <id> <mins>
-                rid = int(rest[0])
-                val = rest[1].lower()
-                if val == "off":
-                    storage.update_reminder_repeat_minutes(rid, None)
-                    write("Répétition désactivée.")
-                else:
-                    mins = int(val)
-                    storage.update_reminder_repeat_minutes(rid, mins)
-                    write(f"Répétition: {mins} minutes.")
-
-
-            # -------- routines: enable/disable / delete / edit --------
-
-            elif op == "rt_del":
-                tid = int(rest[0])
-                storage.delete_routine(tid)
-                write("Routine supprimée.")
-
-            elif op == "rt_enable":
-                tid = int(rest[0])
-                storage.set_routine_enabled(tid, True)
-                write("Routine activée.")
-
-            elif op == "rt_disable":
-                tid = int(rest[0])
-                storage.set_routine_enabled(tid, False)
-                write("Routine désactivée.")
-
-            elif op == "rt_title":
-                tid = int(rest[0])
-                title = " ".join(rest[1:]).strip()
-                storage.update_routine_title(tid, title)
-                write("Titre routine modifié.")
-
-            elif op == "rt_note":
-                tid = int(rest[0])
-                note = " ".join(rest[1:]).strip()
-                storage.update_routine_note(tid, note)
-                write("Note routine modifiée.")
-
-            elif op == "rt_time":
-                tid = int(rest[0])
-                hhmm = rest[1]
-                storage.update_routine_time(tid, hhmm)
-                write(f"Heure routine modifiée: {hhmm}")
-
-
-
-            else:
-                write("Unknown command. Type 'help'.")
-        except Exception as e:
-            write(f"Error: {e}")
-
-    def on_enter(_evt=None) -> None:
-        cmd = entry.get()
-        entry.delete(0, tk.END)
-        write("> " + cmd)
-        handle_command(cmd)
-
-    entry.bind("<Return>", on_enter)
-
-    if prefill:
-        write(prefill)
-        write("")
-
-    for line in HELP_TEXT.splitlines():
-        write(line)
-    write("")
-    write("Type 'quit' to close this window.")
-
-    refresh_recent()
-    entry.focus_set()
-    root.mainloop()
+        return out
 
 
 # -------------------------
-# Service (background)
+# Notifications + UI
 # -------------------------
 
 def send_notification(
@@ -778,10 +528,9 @@ def send_notification(
         "force_foreground": force_foreground,
     }
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-    )
     try:
+        import urllib.request
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
         urllib.request.urlopen(req, timeout=1.5).close()
     except Exception:
         print(f"[NOTIFY FALLBACK] {title}: {message}")
@@ -789,73 +538,376 @@ def send_notification(
 
 def is_ui_already_open(lock_path: Optional[str] = None) -> bool:
     lock_path = lock_path or get_lock_path()
-    # Simple lock file approach for POC.
-    # If lock exists and is "fresh", assume UI is open.
     if not os.path.exists(lock_path):
         return False
     try:
         age = time.time() - os.path.getmtime(lock_path)
-        return age < 60.0  # updated by UI once a second
+        return age < 60.0
     except Exception:
         return False
+
+
+HELP_TEXT = """
+Commands:
+  cycle <name> at <HH:MM> <mins> <message...> [auto_enable] [auto_trigger]
+      Create or replace a cycle. First alert happens at the next HH:MM.
+      After you ack, the next alert is scheduled <mins> minutes later.
+
+  task <cycle_name> <mins> <message...>
+      Append a task to a cycle. After you ack a task, the next one is scheduled <mins> minutes later.
+
+  trigger <cycle_name>
+      Trigger the current task immediately (manual start / manual poke).
+
+  list
+      List cycles and their tasks.
+
+  enable <cycle_name>
+  disable <cycle_name>
+  del <cycle_name>
+
+  reset <cycle_name> [now]
+    Reset a cycle to step 0.
+    If 'now' is given, the first step triggers immediately.
+
+  auto_enable <cycle_name> on|off
+      If ON: at app start, this cycle is forced enabled.
+
+  auto_trigger <cycle_name> on|off
+      If ON: at app start, this cycle is forced enabled AND triggered immediately.
+
+  alerts
+      Show pending alerts.
+
+  ack <cycle_name>
+      Acknowledge the current alert(s) for that cycle AND start the timer for the next task.
+
+  ack_all
+      Acknowledge all alerts (does NOT advance cycles).
+
+  help
+  quit
+
+Example:
+  cycle project at 06:00 90 Start by opening the files of the project
+  task project 15 now we work on the refactoring
+  task project 30 now i want to do a set of pushup
+  task project 30 now we implement the design
+  auto_trigger project on
+  trigger project
+  ack project
+""".strip()
+
+
+def run_ui_popup(prefill: str = "") -> None:
+    import tkinter as tk
+    from tkinter import scrolledtext
+
+    storage = Storage()
+
+    root = tk.Tk()
+    root.title("TimeGuard")
+    root.geometry("760x520")
+    root.bell()
+
+    output = scrolledtext.ScrolledText(root, wrap=tk.WORD)
+    output.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+    entry = tk.Entry(root)
+    entry.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+    def write(line: str) -> None:
+        output.insert(tk.END, line + "\n")
+        output.see(tk.END)
+
+    def print_list() -> None:
+        write("— Cycles —")
+        cycles = storage.list_cycles()
+        if not cycles:
+            write("(none)")
+            write("")
+            return
+        for c in cycles:
+            on = "ON" if c.enabled else "OFF"
+            waiting = "WAIT_ACK" if c.waiting_ack else "READY"
+            ae = "AE" if c.auto_enable else "-"
+            at = "AT" if c.auto_trigger else "-"
+            write(
+                f"[{c.name}] {on} {ae}/{at} start_at={c.start_time_hhmm} next_due={format_dt(c.next_due)} state={waiting} current={c.current_index}"
+            )
+            tasks = storage.list_tasks(c.name)
+            for t in tasks:
+                write(f"  - step {t.index}: +{t.minutes_after_ack}m  {t.message}")
+        write("")
+
+    def handle_command(cmd: str) -> None:
+        parts = cmd.strip().split()
+        if not parts:
+            return
+        op = parts[0].lower()
+        rest = parts[1:]
+
+        try:
+            if op == "help":
+                for line in HELP_TEXT.splitlines():
+                    write(line)
+
+            elif op in ("quit", "exit"):
+                root.destroy()
+
+            elif op == "list":
+                print_list()
+
+            elif op == "cycle":
+                if len(rest) < 5 or rest[1].lower() != "at":
+                    raise ValueError("Usage: cycle <name> at <HH:MM> <mins> <message...> [auto_enable] [auto_trigger]")
+                name = rest[0]
+                hhmm = rest[2]
+                _ = parse_hhmm(hhmm)
+                mins = int(rest[3])
+                tail = rest[4:]
+
+                # Optional trailing flags: auto_enable / auto_trigger
+                flag_tokens = {"auto_enable", "--auto_enable", "auto_trigger", "--auto_trigger"}
+                found = {t.lower() for t in tail if t.lower() in flag_tokens}
+                auto_enable = ("auto_enable" in found) or ("--auto_enable" in found)
+                auto_trigger = ("auto_trigger" in found) or ("--auto_trigger" in found)
+                msg_tokens = [t for t in tail if t.lower() not in flag_tokens]
+                msg = " ".join(msg_tokens).strip()
+                if not msg:
+                    raise ValueError("Message required.")
+                storage.create_cycle(
+                    name=name,
+                    start_time_hhmm=hhmm,
+                    first_minutes=mins,
+                    first_message=msg,
+                    auto_enable=auto_enable,
+                    auto_trigger=auto_trigger,
+                )
+                flags = []
+                if auto_enable:
+                    flags.append("auto_enable")
+                if auto_trigger:
+                    flags.append("auto_trigger")
+                extra = (" [" + ", ".join(flags) + "]") if flags else ""
+                write(f"Created cycle [{name}] at {hhmm}. First delay after ack: {mins}m.{extra}")
+
+            elif op == "task":
+                if len(rest) < 3:
+                    raise ValueError("Usage: task <cycle_name> <mins> <message...>")
+                name = rest[0]
+                mins = int(rest[1])
+                msg = " ".join(rest[2:]).strip()
+                idx = storage.add_task(name, mins, msg)
+                write(f"Added task to [{name}] as step {idx} (+{mins}m).")
+
+            elif op == "trigger":
+                if len(rest) != 1:
+                    raise ValueError("Usage: trigger <cycle_name>")
+                name = rest[0]
+                storage.trigger_cycle(name)
+                write(f"Triggered [{name}] (next tick will fire it).")
+
+            elif op == "enable":
+                if len(rest) != 1:
+                    raise ValueError("Usage: enable <cycle_name>")
+                storage.set_cycle_enabled(rest[0], True)
+                write("Enabled.")
+
+            elif op == "disable":
+                if len(rest) != 1:
+                    raise ValueError("Usage: disable <cycle_name>")
+                storage.set_cycle_enabled(rest[0], False)
+                write("Disabled.")
+
+            elif op == "del":
+                if len(rest) != 1:
+                    raise ValueError("Usage: del <cycle_name>")
+                storage.delete_cycle(rest[0])
+                write("Deleted.")
+
+            elif op == "auto_enable":
+                if len(rest) != 2 or rest[1].lower() not in ("on", "off"):
+                    raise ValueError("Usage: auto_enable <cycle_name> on|off")
+                name = rest[0]
+                val = rest[1].lower() == "on"
+                storage.set_cycle_auto_enable(name, val)
+                write(f"auto_enable for [{name}] set to {'ON' if val else 'OFF'}.")
+
+            elif op == "auto_trigger":
+                if len(rest) != 2 or rest[1].lower() not in ("on", "off"):
+                    raise ValueError("Usage: auto_trigger <cycle_name> on|off")
+                name = rest[0]
+                val = rest[1].lower() == "on"
+                storage.set_cycle_auto_trigger(name, val)
+                write(f"auto_trigger for [{name}] set to {'ON' if val else 'OFF'}.")
+
+            elif op == "reset":
+                if len(rest) not in (1, 2):
+                    raise ValueError("Usage: reset <cycle_name> [now]")
+                name = rest[0]
+                immediate = (len(rest) == 2 and rest[1].lower() == "now")
+                storage.reset_cycle(name, immediate=immediate)
+                if immediate:
+                    write(f"Cycle [{name}] reset and triggered immediately.")
+                else:
+                    write(f"Cycle [{name}] reset to start (next start_at).")
+
+            elif op == "alerts":
+                rows = storage.get_unacked_alerts()
+                if not rows:
+                    write("No pending alerts.")
+                else:
+                    write("— Pending alerts —")
+                    for name, ts, src, msg in rows:
+                        write(f"[{name}] {ts} ({src}) {msg}")
+                    write("Use: ack <cycle_name> | ack_all")
+
+            elif op == "ack":
+                if len(rest) != 1:
+                    raise ValueError("Usage: ack <cycle_name>")
+                name = rest[0]
+                n = storage.ack_alerts_by_name(name)
+                storage.advance_cycle_on_ack(name)
+                write(f"Acknowledged {n} alert(s) for '{name}'. Next task scheduled from now.")
+
+            elif op == "ack_all":
+                n = storage.ack_all_alerts()
+
+                # Advance all cycles that were waiting for acknowledgement
+                for c in storage.list_cycles():
+                    if c.waiting_ack:
+                        storage.advance_cycle_on_ack(c.name)
+
+                write(f"Acknowledged {n} alert(s). Advanced waiting cycles.")
+
+            else:
+                write("Unknown command. Type 'help'.")
+        except Exception as e:
+            write(f"Error: {e}")
+
+    def on_enter(_evt=None) -> None:
+        cmd = entry.get()
+        entry.delete(0, tk.END)
+        write("> " + cmd)
+        handle_command(cmd)
+
+    entry.bind("<Return>", on_enter)
+
+    if prefill:
+        write(prefill)
+        write("")
+
+    for line in HELP_TEXT.splitlines():
+        write(line)
+    write("")
+    write("Type 'quit' to close this window.")
+    write("")
+    print_list()
+    entry.focus_set()
+    root.mainloop()
+
+
+# -------------------------
+# Background service
+# -------------------------
+
+class ServiceRunner:
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        last_nag = 0.0
+        nag_every_seconds = 60.0
+
+        storage = Storage()
+        storage.apply_autostart()
+        engine = Engine(storage)
+
+        while not self._stop.is_set():
+            notes = engine.tick()
+            now_t = time.time()
+
+            if now_t - last_nag >= nag_every_seconds:
+                unacked = storage.get_unacked_alerts()
+                if unacked:
+                    last_nag = now_t
+                    preview = "\n".join([f"{name}: {msg}" for (name, _ts, _src, msg) in unacked[:3]])
+                    if len(unacked) > 3:
+                        preview += f"\n(+{len(unacked)-3} more)"
+                    send_notification("Pending alerts (ack needed)", preview, blink_seconds=12, force_foreground=True)
+
+            if notes:
+                for name, source, message, meta in notes:
+                    storage.add_alert(name=name, message=message, source=source, meta=meta)
+
+                msg = "\n".join([m for (_n, _s, m, _meta) in notes[:3]]) + (
+                    "" if len(notes) <= 3 else f"\n(+{len(notes)-3} more)"
+                )
+                send_notification("TimeGuard", msg, blink_seconds=12, force_foreground=True)
+
+                if not is_ui_already_open():
+                    subprocess.Popen(get_self_launch_cmd() + ["--ui"])
+
+            time.sleep(2.0)
 
 
 def run_service() -> None:
     last_nag = 0.0
     nag_every_seconds = 60.0
+
     storage = Storage()
-    storage.enable_all_reminders()
-    storage.enable_all_routines()
+    storage.apply_autostart()
     engine = Engine(storage)
 
-    print("Assistant service running. (Ctrl+C to stop)")
+    print("TimeGuard service running. (Ctrl+C to stop)")
     while True:
         notes = engine.tick()
 
-        # Persistent nags while there are unacknowledged alerts
         now_t = time.time()
         if now_t - last_nag >= nag_every_seconds:
             unacked = storage.get_unacked_alerts()
             if unacked:
                 last_nag = now_t
-                preview = "\n".join([f"[{aid}] {msg}" for (aid, _ts, _src, msg) in unacked[:3]])
+                preview = "\n".join([f"{name}: {msg}" for (name, _ts, _src, msg) in unacked[:3]])
                 if len(unacked) > 3:
                     preview += f"\n(+{len(unacked)-3} more)"
                 send_notification("Pending alerts (ack needed)", preview)
-
                 if not is_ui_already_open():
                     subprocess.Popen(get_self_launch_cmd() + ["--ui"])
 
-
         if notes:
-            # Create one alert per note (so you can acknowledge individually)
-            for n in notes:
-                storage.add_alert(n, source="reminder")  # or "routine" if you want to distinguish
-
-            # Send a notification right away
-            msg = "\n".join(notes[:3]) + ("" if len(notes) <= 3 else f"\n(+{len(notes)-3} more)")
-            send_notification("Personal Assistant", msg)
-
+            for name, source, message, meta in notes:
+                storage.add_alert(name=name, message=message, source=source, meta=meta)
+            msg = "\n".join([m for (_n, _s, m, _meta) in notes[:3]]) + (
+                "" if len(notes) <= 3 else f"\n(+{len(notes)-3} more)"
+            )
+            send_notification("TimeGuard", msg)
             if not is_ui_already_open():
                 subprocess.Popen(get_self_launch_cmd() + ["--ui"])
-
 
         time.sleep(2.0)
 
 
 def run_ui_mode(prefill: str) -> None:
-    # Update lock file periodically so service knows UI is open
     lock_path = get_lock_path()
     with open(lock_path, "w", encoding="utf-8") as f:
         f.write("open")
 
-    # Background thread to "touch" lock file
-    import threading
-
-    stop = False
+    stop_flag = {"stop": False}
 
     def toucher() -> None:
-        while not stop:
+        while not stop_flag["stop"]:
             try:
                 os.utime(lock_path, None)
             except Exception:
@@ -868,11 +920,12 @@ def run_ui_mode(prefill: str) -> None:
     try:
         run_ui_popup(prefill=prefill)
     finally:
-        stop = True
+        stop_flag["stop"] = True
         try:
             os.remove(lock_path)
         except Exception:
             pass
+
 
 def run_tray() -> None:
     runner = ServiceRunner()
@@ -889,17 +942,13 @@ def run_tray() -> None:
         pystray.MenuItem("Open UI", on_open),
         pystray.MenuItem("Quit", on_quit),
     )
-
     icon = pystray.Icon("TimeGuard", make_tray_icon(), "TimeGuard", menu)
     icon.run()
 
-# -------------------------
-# Entrypoint
-# -------------------------
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--service", action="store_true", help="Run background reminder service")
+    ap.add_argument("--service", action="store_true", help="Run background service")
     ap.add_argument("--ui", action="store_true", help="Run UI popup window")
     ap.add_argument("--prefill", type=str, default="", help="Prefill message for UI")
     ap.add_argument("--tray", action="store_true", help="Run tray daemon")
@@ -917,7 +966,6 @@ def main() -> None:
         run_tray()
         return
 
-    # Default: open UI
     run_tray()
 
 

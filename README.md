@@ -19,3 +19,6 @@ When something is due:
 you’ll get a system notification
 
 the window pops up automatically (only once; it won’t spam multiple windows)
+
+
+pyinstaller --noconsole --onefile time_guard.py --collect-all uvicorn --collect-all fastapi --collect-all starlette --collect-all anyio
