@@ -1,8 +1,11 @@
 # TimeGuard
 
-TimeGuard is a **local, name-based time and cycle manager** designed for people who want strong control over routines without cloud sync, IDs, or noisy abstractions.
+TimeGuard is a **podomoro cycle manager** designed without cloud sync, or noisy abstractions.
 
 It runs as a **background service + tray app** and lets you define **cycles** made of sequential tasks that only advance when *you acknowledge them*.
+
+It uses this specific notifier to alert the user of the next task :
+https://github.com/CptGloo/notifier_daemon
 
 This project intentionally starts **fresh** (no legacy compatibility) and favors:
 - explicit commands
@@ -14,14 +17,12 @@ This project intentionally starts **fresh** (no legacy compatibility) and favors
 ## Core Concepts
 
 ### Cycle
-A **cycle** is a named routine composed of ordered steps (tasks).
+A **cycle** is a named routine composed of ordered steps or tasks.
 
 Each step:
 - shows an alert
 - waits for your acknowledgment (`ACK`)
-- only then schedules the next step
-
-A cycle never advances silently.
+- schedules the next step
 
 Example mental model:
 ```
@@ -56,7 +57,6 @@ There is **no automatic progression**.
 
 ### Requirements
 - Python 3.10+
-- Windows, Linux, or macOS
 
 ### Run directly
 ```bash
@@ -109,8 +109,8 @@ list
 
 Output example:
 ```text
-[travail] ON AE/- start_at=06:00 next_due=2026-02-05 10:55 state=WAIT_ACK current=0
-  - step 0: +25m Examens Studi
+[studying] ON AE/- start_at=06:00 next_due=2026-02-05 10:55 state=WAIT_ACK current=0
+  - step 0: +25m Examens
   - step 1: +10m pause
 ```
 
@@ -205,58 +205,5 @@ Shows all pending (unacked) alerts.
 The database is:
 - local-only
 - automatically reset if schema mismatches
-- never migrated intentionally
 
 ---
-
-## Design Philosophy
-
-TimeGuard is built around a few strict rules:
-
-- **Names, not IDs**
-- **Acknowledgment drives time**
-- **No silent progression**
-- **Local-first, offline-first**
-- **Explicit over clever**
-
-If something happens, it is because you either:
-- acknowledged it
-- triggered it
-- reset it
-
-Nothing else.
-
----
-
-## Non-goals
-
-- No cloud sync
-- No mobile app
-- No analytics
-- No AI scheduling
-- No habit gamification
-
-This is a tool, not a coach.
-
----
-
-## Roadmap ideas (optional)
-
-- `reset_all`
-- `jump <cycle> <step>`
-- `pause <cycle>` / `resume <cycle>`
-- export / import cycles
-
----
-
-## License
-
-MIT (or whatever you choose)
-
----
-
-## Final note
-
-If you like systems that:
-- behave exactly as specified
-- don’t surprise y
