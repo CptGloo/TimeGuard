@@ -377,6 +377,7 @@ class Storage:
         )
         self._conn.commit()
 
+        
     def list_tasks(self, cycle_name: str) -> List[CycleTask]:
         cur = self._conn.execute(
             """
@@ -389,14 +390,12 @@ class Storage:
         )
         return [CycleTask(index=int(i), minutes_after_ack=int(m), message=msg) for (i, m, msg) in cur.fetchall()]
 
-    def reset_cycle(self, name: str, immediate: bool = False) -> None:
-        c = self.get_cycle(name)
+    def reset_cycle(self, name: str) -> None:
+        """Reset a cycle to step 0 and put it into WAIT_ACK.
 
-        if immediate:
-            next_due = datetime.now()
-        else:
-            next_due = next_occurrence_at(c.start_time_hhmm)
-
+        Semantics: behaves as if step 0 just fired. You must `ack <name>` to start timing again.
+        """
+        now_iso = datetime.now().isoformat(timespec="seconds")
         self._conn.execute(
             """
             UPDATE cycles
@@ -405,11 +404,47 @@ class Storage:
                 next_due=?
             WHERE name=?
             """,
-            (next_due.isoformat(timespec="seconds"), name),
+            (now_iso, name),
         )
         self._conn.commit()
 
-    # ---- alerts ----
+    def redo_cycle(self, name: str, task_index: Optional[int] = None) -> int:
+        """Redo a task inside a cycle.
+
+        - If task_index is None: redo the current task.
+        - Otherwise: set the cycle to that task index.
+        In both cases the cycle is put into WAIT_ACK and next_due is set to now.
+
+        Returns the task index that will be redone.
+        """
+        c = self.get_cycle(name)
+        tasks = self.list_tasks(name)
+        if not tasks:
+            raise ValueError(f"Cycle '{name}' has no tasks.")
+
+        valid = {t.index for t in tasks}
+        idx = c.current_index if task_index is None else int(task_index)
+        if idx not in valid:
+            raise ValueError(f"Invalid task index {idx} for cycle '{name}'. Valid: {sorted(valid)}")
+
+        # A redo supersedes older pending alerts for the same cycle.
+        self.ack_alerts_by_name(name)
+
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        self._conn.execute(
+            """
+            UPDATE cycles
+            SET current_index=?,
+                waiting_ack=1,
+                next_due=?
+            WHERE name=?
+            """,
+            (idx, now_iso, name),
+        )
+        self._conn.commit()
+        return idx
+
+# ---- alerts ----
 
     def add_alert(self, name: str, message: str, source: str, meta: dict) -> str:
         alert_key = uuid.uuid4().hex
@@ -470,7 +505,6 @@ class Storage:
     def mark_cycle_waiting_ack(self, name: str) -> None:
         self._conn.execute("UPDATE cycles SET waiting_ack=1 WHERE name=?", (name,))
         self._conn.commit()
-
 
 
 # -------------------------
@@ -565,10 +599,14 @@ Commands:
   enable <cycle_name>
   disable <cycle_name>
   del <cycle_name>
+  reset <cycle_name>
+      Reset the cycle to step 0 and put it into WAIT_ACK (as if step 0 just fired).
 
-  reset <cycle_name> [now]
-    Reset a cycle to step 0.
-    If 'now' is given, the first step triggers immediately.
+  redo <cycle_name> [task_index]
+      Redo a task and put the cycle into WAIT_ACK.
+      - Without task_index: redo the current task.
+      - With task_index: redo that specific step number (e.g. redo work 3).
+
 
   auto_enable <cycle_name> on|off
       If ON: at app start, this cycle is forced enabled.
@@ -726,6 +764,33 @@ def run_ui_popup(prefill: str = "") -> None:
                 storage.delete_cycle(rest[0])
                 write("Deleted.")
 
+            elif op == "reset":
+                if len(rest) != 1:
+                    raise ValueError("Usage: reset <cycle_name>")
+                name = rest[0]
+                storage.reset_cycle(name)
+
+                tasks = storage.list_tasks(name)
+                task0 = next((t for t in tasks if t.index == 0), tasks[0])
+                storage.add_alert(name=name, message=task0.message, source="cycle", meta={"task_index": task0.index, "reset": True})
+                send_notification("TimeGuard (reset)", f"[{name}] step {task0.index}: {task0.message}", blink_seconds=12, force_foreground=True)
+
+                write(f"Cycle [{name}] reset to step 0 (WAIT_ACK).")
+
+            elif op == "redo":
+                if len(rest) not in (1, 2):
+                    raise ValueError("Usage: redo <cycle_name> [task_index]")
+                name = rest[0]
+                idx = int(rest[1]) if len(rest) == 2 else None
+                chosen = storage.redo_cycle(name, idx)
+
+                tasks = storage.list_tasks(name)
+                task = next((t for t in tasks if t.index == chosen), tasks[0])
+                storage.add_alert(name=name, message=task.message, source="cycle", meta={"task_index": task.index, "redo": True})
+                send_notification("TimeGuard (redo)", f"[{name}] step {task.index}: {task.message}", blink_seconds=12, force_foreground=True)
+
+                write(f"Cycle [{name}] redo step {chosen} (WAIT_ACK).")
+
             elif op == "auto_enable":
                 if len(rest) != 2 or rest[1].lower() not in ("on", "off"):
                     raise ValueError("Usage: auto_enable <cycle_name> on|off")
@@ -741,17 +806,6 @@ def run_ui_popup(prefill: str = "") -> None:
                 val = rest[1].lower() == "on"
                 storage.set_cycle_auto_trigger(name, val)
                 write(f"auto_trigger for [{name}] set to {'ON' if val else 'OFF'}.")
-
-            elif op == "reset":
-                if len(rest) not in (1, 2):
-                    raise ValueError("Usage: reset <cycle_name> [now]")
-                name = rest[0]
-                immediate = (len(rest) == 2 and rest[1].lower() == "now")
-                storage.reset_cycle(name, immediate=immediate)
-                if immediate:
-                    write(f"Cycle [{name}] reset and triggered immediately.")
-                else:
-                    write(f"Cycle [{name}] reset to start (next start_at).")
 
             elif op == "alerts":
                 rows = storage.get_unacked_alerts()
