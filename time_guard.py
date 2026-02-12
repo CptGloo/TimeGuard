@@ -176,6 +176,12 @@ class Storage:
                 meta_json TEXT NOT NULL       -- {"task_index":int}
             );
 
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+
             CREATE INDEX IF NOT EXISTS idx_active_alerts_ack
             ON active_alerts(acknowledged, created_at);
 
@@ -378,6 +384,65 @@ class Storage:
         self._conn.commit()
 
         
+
+    # ---- snooze (global) ----
+
+    def get_snoozed_until(self) -> Optional[datetime]:
+        row = self._conn.execute(
+            "SELECT value FROM app_state WHERE key='snoozed_until'"
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return datetime.fromisoformat(row[0])
+        except Exception:
+            return None
+
+    def is_snoozed(self, now: Optional[datetime] = None) -> bool:
+        now = now or datetime.now()
+        until = self.get_snoozed_until()
+        return bool(until and until > now)
+
+    def set_snooze(self, minutes: int) -> datetime:
+        """Snooze everything for N minutes.
+
+        - Acks all pending alerts
+        - Clears WAIT_ACK for all cycles
+        - Delays next_due by N minutes (from max(now, next_due))
+        - Stores global snoozed_until for UI indicator
+        """
+        minutes = int(minutes)
+        if minutes <= 0:
+            raise ValueError("Snooze minutes must be > 0")
+
+        now = datetime.now()
+        delta = timedelta(minutes=minutes)
+        until = now + delta
+
+        # Store global snooze marker
+        self._conn.execute(
+            "INSERT INTO app_state(key, value) VALUES('snoozed_until', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (until.isoformat(timespec="seconds"),),
+        )
+
+        # Ack all current alerts and push cycles forward
+        self._conn.execute("UPDATE active_alerts SET acknowledged=1 WHERE acknowledged=0")
+
+        for c in self.list_cycles():
+            new_due = max(c.next_due, now) + delta
+            self._conn.execute(
+                "UPDATE cycles SET next_due=?, waiting_ack=0 WHERE name=?",
+                (new_due.isoformat(timespec="seconds"), c.name),
+            )
+
+        self._conn.commit()
+        return until
+
+    def clear_snooze(self) -> None:
+        self._conn.execute("DELETE FROM app_state WHERE key='snoozed_until'")
+        self._conn.commit()
+
     def list_tasks(self, cycle_name: str) -> List[CycleTask]:
         cur = self._conn.execute(
             """
@@ -443,34 +508,6 @@ class Storage:
         )
         self._conn.commit()
         return idx
-
-    def snooze_all(self, minutes: int) -> None:
-        """Globally delay all cycles by X minutes and clear WAIT_ACK."""
-        if minutes <= 0:
-            raise ValueError("Snooze minutes must be > 0")
-
-        delta = timedelta(minutes=int(minutes))
-
-        cycles = self.list_cycles()
-        for c in cycles:
-            new_due = max(c.next_due, datetime.now()) + delta
-            self._conn.execute(
-                """
-                UPDATE cycles
-                SET next_due=?,
-                    waiting_ack=0
-                WHERE name=?
-                """,
-                (new_due.isoformat(timespec="seconds"), c.name),
-            )
-
-        # Also acknowledge all pending alerts
-        self._conn.execute(
-            "UPDATE active_alerts SET acknowledged=1 WHERE acknowledged=0"
-        )
-
-        self._conn.commit()
-
 
 # ---- alerts ----
 
@@ -545,6 +582,8 @@ class Engine:
 
     def tick(self) -> List[Tuple[str, str, str, dict]]:
         now = datetime.now()
+        if self._storage.is_snoozed(now):
+            return []
         out: List[Tuple[str, str, str, dict]] = []
 
         for c in self._storage.list_cycles():
@@ -635,8 +674,16 @@ Commands:
       - Without task_index: redo the current task.
       - With task_index: redo that specific step number (e.g. redo work 3).
 
+
+
   snooze <minutes>
-      Delay all cycles and suppress alerts for X minutes.
+      Snooze everything for N minutes:
+      - stops alerts from popping
+      - pauses timers by pushing all next_due forward
+      - clears WAIT_ACK and acks pending alerts
+
+  unsnooze
+      Clear the snooze indicator (does not change cycle next_due).
 
   auto_enable <cycle_name> on|off
       If ON: at app start, this cycle is forced enabled.
@@ -690,6 +737,11 @@ def run_ui_popup(prefill: str = "") -> None:
 
     def print_list() -> None:
         write("— Cycles —")
+        snoozed_until = storage.get_snoozed_until()
+        if snoozed_until and snoozed_until > datetime.now():
+            remaining = int((snoozed_until - datetime.now()).total_seconds() // 60)
+            write(f"[GLOBAL] SNOOZED until {format_dt(snoozed_until)} (~{remaining}m remaining)")
+        
         cycles = storage.list_cycles()
         if not cycles:
             write("(none)")
@@ -821,6 +873,19 @@ def run_ui_popup(prefill: str = "") -> None:
 
                 write(f"Cycle [{name}] redo step {chosen} (WAIT_ACK).")
 
+
+            elif op == "snooze":
+                if len(rest) != 1:
+                    raise ValueError("Usage: snooze <minutes>")
+                mins = int(rest[0])
+                until = storage.set_snooze(mins)
+                send_notification("TimeGuard (snoozed)", f"Snoozed for {mins} min (until {format_dt(until)}).", blink_seconds=8, force_foreground=False)
+                write(f"Snoozed everything for {mins} minutes (until {format_dt(until)}).")
+
+            elif op == "unsnooze":
+                storage.clear_snooze()
+                write("Snooze cleared.")
+
             elif op == "auto_enable":
                 if len(rest) != 2 or rest[1].lower() not in ("on", "off"):
                     raise ValueError("Usage: auto_enable <cycle_name> on|off")
@@ -828,13 +893,6 @@ def run_ui_popup(prefill: str = "") -> None:
                 val = rest[1].lower() == "on"
                 storage.set_cycle_auto_enable(name, val)
                 write(f"auto_enable for [{name}] set to {'ON' if val else 'OFF'}.")
-
-            elif op == "snooze":
-                if len(rest) != 1:
-                    raise ValueError("Usage: snooze <minutes>")
-                mins = int(rest[0])
-                storage.snooze_all(mins)
-                write(f"Snoozed all cycles for {mins} minutes.")
 
             elif op == "auto_trigger":
                 if len(rest) != 2 or rest[1].lower() not in ("on", "off"):
