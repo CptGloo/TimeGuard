@@ -426,15 +426,16 @@ class Storage:
             (until.isoformat(timespec="seconds"),),
         )
 
-        # Ack all current alerts and push cycles forward
-        self._conn.execute("UPDATE active_alerts SET acknowledged=1 WHERE acknowledged=0")
-
+        # Pause timers for cycles that are READY (waiting_ack=0).
         for c in self.list_cycles():
+            if c.waiting_ack:
+                continue
             new_due = max(c.next_due, now) + delta
             self._conn.execute(
-                "UPDATE cycles SET next_due=?, waiting_ack=0 WHERE name=?",
+                "UPDATE cycles SET next_due=? WHERE name=?",
                 (new_due.isoformat(timespec="seconds"), c.name),
             )
+
 
         self._conn.commit()
         return until
@@ -678,9 +679,9 @@ Commands:
 
   snooze <minutes>
       Snooze everything for N minutes:
-      - stops alerts from popping
-      - pauses timers by pushing all next_due forward
-      - clears WAIT_ACK and acks pending alerts
+      - suppresses notifications
+      - pauses READY timers by pushing next_due
+      - does not change WAIT_ACK cycles
 
   unsnooze
       Clear the snooze indicator (does not change cycle next_due).
@@ -987,7 +988,7 @@ class ServiceRunner:
             notes = engine.tick()
             now_t = time.time()
 
-            if now_t - last_nag >= nag_every_seconds:
+            if now_t - last_nag >= nag_every_seconds and not storage.is_snoozed():
                 unacked = storage.get_unacked_alerts()
                 if unacked:
                     last_nag = now_t
@@ -1024,7 +1025,7 @@ def run_service() -> None:
         notes = engine.tick()
 
         now_t = time.time()
-        if now_t - last_nag >= nag_every_seconds:
+        if now_t - last_nag >= nag_every_seconds and not storage.is_snoozed():
             unacked = storage.get_unacked_alerts()
             if unacked:
                 last_nag = now_t
