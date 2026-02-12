@@ -444,6 +444,34 @@ class Storage:
         self._conn.commit()
         return idx
 
+    def snooze_all(self, minutes: int) -> None:
+        """Globally delay all cycles by X minutes and clear WAIT_ACK."""
+        if minutes <= 0:
+            raise ValueError("Snooze minutes must be > 0")
+
+        delta = timedelta(minutes=int(minutes))
+
+        cycles = self.list_cycles()
+        for c in cycles:
+            new_due = max(c.next_due, datetime.now()) + delta
+            self._conn.execute(
+                """
+                UPDATE cycles
+                SET next_due=?,
+                    waiting_ack=0
+                WHERE name=?
+                """,
+                (new_due.isoformat(timespec="seconds"), c.name),
+            )
+
+        # Also acknowledge all pending alerts
+        self._conn.execute(
+            "UPDATE active_alerts SET acknowledged=1 WHERE acknowledged=0"
+        )
+
+        self._conn.commit()
+
+
 # ---- alerts ----
 
     def add_alert(self, name: str, message: str, source: str, meta: dict) -> str:
@@ -607,6 +635,8 @@ Commands:
       - Without task_index: redo the current task.
       - With task_index: redo that specific step number (e.g. redo work 3).
 
+  snooze <minutes>
+      Delay all cycles and suppress alerts for X minutes.
 
   auto_enable <cycle_name> on|off
       If ON: at app start, this cycle is forced enabled.
@@ -798,6 +828,13 @@ def run_ui_popup(prefill: str = "") -> None:
                 val = rest[1].lower() == "on"
                 storage.set_cycle_auto_enable(name, val)
                 write(f"auto_enable for [{name}] set to {'ON' if val else 'OFF'}.")
+
+            elif op == "snooze":
+                if len(rest) != 1:
+                    raise ValueError("Usage: snooze <minutes>")
+                mins = int(rest[0])
+                storage.snooze_all(mins)
+                write(f"Snoozed all cycles for {mins} minutes.")
 
             elif op == "auto_trigger":
                 if len(rest) != 2 or rest[1].lower() not in ("on", "off"):
