@@ -181,8 +181,14 @@ class Storage:
                 value TEXT NOT NULL
             );
 
+            -- Per-cycle pause info used by snooze (stores remaining time until due)
+            CREATE TABLE IF NOT EXISTS cycle_pause (
+                cycle_name TEXT PRIMARY KEY,
+                remaining_seconds INTEGER NOT NULL,
+                FOREIGN KEY (cycle_name) REFERENCES cycles(name) ON DELETE CASCADE
+            );
 
-            CREATE INDEX IF NOT EXISTS idx_active_alerts_ack
+CREATE INDEX IF NOT EXISTS idx_active_alerts_ack
             ON active_alerts(acknowledged, created_at);
 
             CREATE INDEX IF NOT EXISTS idx_active_alerts_name
@@ -404,12 +410,13 @@ class Storage:
         return bool(until and until > now)
 
     def set_snooze(self, minutes: int) -> datetime:
-        """Snooze everything for N minutes.
+        """Snooze notifications and pause READY timers for N minutes.
 
-        - Acks all pending alerts
-        - Clears WAIT_ACK for all cycles
-        - Delays next_due by N minutes (from max(now, next_due))
-        - Stores global snoozed_until for UI indicator
+        Key behavior:
+        - DOES NOT modify cycles in WAIT_ACK (they still require your ack).
+        - Pauses only READY timers by storing the remaining time until due.
+        - Suppresses notifications while snoozed (engine returns no notes).
+        - On unsnooze (or snooze expiry), READY timers resume with the same remaining time.
         """
         minutes = int(minutes)
         if minutes <= 0:
@@ -417,32 +424,69 @@ class Storage:
 
         now = datetime.now()
         delta = timedelta(minutes=minutes)
-        until = now + delta
 
-        # Store global snooze marker
+        current_until = self.get_snoozed_until()
+        base = current_until if (current_until and current_until > now) else now
+        until = base + delta
+
+        # If we're entering snooze (not extending), snapshot remaining time for READY cycles.
+        entering = not (current_until and current_until > now)
+        if entering:
+            for c in self.list_cycles():
+                if not c.enabled:
+                    continue
+                if c.waiting_ack:
+                    continue  # keep WAIT_ACK intact
+                remaining = max(0, int((c.next_due - now).total_seconds()))
+                self._conn.execute(
+                    "INSERT INTO cycle_pause(cycle_name, remaining_seconds) VALUES(?, ?) "
+                    "ON CONFLICT(cycle_name) DO UPDATE SET remaining_seconds=excluded.remaining_seconds",
+                    (c.name, remaining),
+                )
+
+        # Store / update global snooze marker
         self._conn.execute(
             "INSERT INTO app_state(key, value) VALUES('snoozed_until', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (until.isoformat(timespec="seconds"),),
         )
 
-        # Pause timers for cycles that are READY (waiting_ack=0).
-        for c in self.list_cycles():
-            if c.waiting_ack:
-                continue
-            new_due = max(c.next_due, now) + delta
-            self._conn.execute(
-                "UPDATE cycles SET next_due=? WHERE name=?",
-                (new_due.isoformat(timespec="seconds"), c.name),
-            )
-
-
         self._conn.commit()
         return until
 
     def clear_snooze(self) -> None:
+        """Clear snooze and resume READY timers using saved remaining time."""
+        now = datetime.now()
+
+        # Resume paused READY cycles (WAIT_ACK cycles were never changed)
+        cur = self._conn.execute("SELECT cycle_name, remaining_seconds FROM cycle_pause")
+        for cycle_name, remaining_seconds in cur.fetchall():
+            # Only adjust if the cycle is currently READY
+            try:
+                c = self.get_cycle(cycle_name)
+            except Exception:
+                continue
+            if c.waiting_ack:
+                continue
+            new_due = now + timedelta(seconds=int(remaining_seconds))
+            self._conn.execute(
+                "UPDATE cycles SET next_due=? WHERE name=?",
+                (new_due.isoformat(timespec="seconds"), cycle_name),
+            )
+
+        self._conn.execute("DELETE FROM cycle_pause")
         self._conn.execute("DELETE FROM app_state WHERE key='snoozed_until'")
         self._conn.commit()
+
+    def maybe_restore_expired_snooze(self) -> None:
+        """If snooze has expired but pause data still exists, restore timers once."""
+        until = self.get_snoozed_until()
+        if not until:
+            return
+        if until > datetime.now():
+            return
+        # Expired: restore and clear markers
+        self.clear_snooze()
 
     def list_tasks(self, cycle_name: str) -> List[CycleTask]:
         cur = self._conn.execute(
@@ -679,12 +723,12 @@ Commands:
 
   snooze <minutes>
       Snooze everything for N minutes:
-      - suppresses notifications
-      - pauses READY timers by pushing next_due
-      - does not change WAIT_ACK cycles
+      - stops alerts from popping (including pending-alert nags)
+      - pauses READY timers (WAIT_ACK cycles are not changed)
+      - timers resume on unsnooze or when snooze expires
 
   unsnooze
-      Clear the snooze indicator (does not change cycle next_due).
+      End snooze now and resume paused READY timers.
 
   auto_enable <cycle_name> on|off
       If ON: at app start, this cycle is forced enabled.
@@ -985,6 +1029,7 @@ class ServiceRunner:
         engine = Engine(storage)
 
         while not self._stop.is_set():
+            storage.maybe_restore_expired_snooze()
             notes = engine.tick()
             now_t = time.time()
 
@@ -1022,6 +1067,7 @@ def run_service() -> None:
 
     print("TimeGuard service running. (Ctrl+C to stop)")
     while True:
+        storage.maybe_restore_expired_snooze()
         notes = engine.tick()
 
         now_t = time.time()
